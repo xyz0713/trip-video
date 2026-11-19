@@ -9,12 +9,14 @@ def mark(label):
     print(datetime.now(timezone.utc).isoformat(timespec='seconds'), label, f'{time.perf_counter()-start:.1f}s', flush=True)
 def run(args, **kwargs):
     return subprocess.run(args, check=True, **kwargs)
-def generate_shots(scenes, graph, comfy, server, log_path, base, node, first):
+def generate_shots(job, graph, comfy, server, log_path, base, node, first):
     sources=[]
-    for shot, (scene, frames) in enumerate(zip(scenes, (73, 73, 107), strict=True), 1):
+    width, height = job.get('model_size') or [((job[axis] + 31) // 32) * 32 for axis in ('width', 'height')]
+    for shot, scene in enumerate(job['shots'], 1):
         job_graph=copy.deepcopy(graph)
         job_graph['image']['inputs']['image']=f'ref_{shot}.jpg'
-        job_graph[node]['inputs'].update({'prompt':scene['prompt'],'length':frames})
+        job_graph[node]['inputs'].update(prompt=scene['prompt'], width=width, height=height,
+                                         length=max(5, scene['frames']))
         if scene['image']:
             job_graph[node]['inputs'][first]=['image',0]
         else:
@@ -35,6 +37,25 @@ def generate_shots(scenes, graph, comfy, server, log_path, base, node, first):
         sources.append(max((comfy/'output'/'video').glob(prefix+'*.mp4'),key=lambda p:p.stat().st_mtime))
         mark(f'SHOT_{shot}_DONE {time.perf_counter()-shot_start:.1f}s')
     return sources
+
+
+def encode(sources, job, destination):
+    width, height = job['width'], job['height']
+    args = ['ffmpeg', '-y', '-loglevel', 'error']
+    filters = []
+    pads = []
+    for i, (src, scene) in enumerate(zip(sources, job['shots'], strict=True)):
+        args.extend(['-i', str(src)])
+        frames = scene['frames']
+        filters.append(f'[{i}:v]trim=end_frame={frames},setpts=PTS-STARTPTS,'
+                       f'scale={width}:{height}:force_original_aspect_ratio=increase,'
+                       f'crop={width}:{height},setsar=1[v{i}]')
+        filters.append(f'[{i}:a]apad,atrim=duration={frames / 24:.8f},asetpts=PTS-STARTPTS[a{i}]')
+        pads.append(f'[v{i}][a{i}]')
+    filters.append(''.join(pads) + f'concat=n={len(sources)}:v=1:a=1[v][a]')
+    run(args + ['-filter_complex', ';'.join(filters), '-map', '[v]', '-map', '[a]',
+                '-r', '24', '-c:v', 'libx264', '-crf', '17', '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', str(destination)])
 
 
 def main():
@@ -93,22 +114,14 @@ def main():
     schema=requests.get(base+'/object_info/MiniMaxH3ImageToVideo',timeout=10).json()['MiniMaxH3ImageToVideo']['input']
     image_params=[k for k,v in schema.get('optional',{}).items() if v[0]=='IMAGE']
     first=next((k for k in image_params if 'start' in k or 'first' in k),None)
-    if first is None: raise RuntimeError(f'No first frame input in {image_params}')
+    if first is None and any(shot['image'] for shot in job['shots']): raise RuntimeError(f'No first frame input in {image_params}')
     generation_start=time.perf_counter()
     mark('GENERATION_START')
-    sources = generate_shots(job['shots'], graph, comfy, server, log_path, base, node, first)
+    sources = generate_shots(job, graph, comfy, server, log_path, base, node, first)
     generation_s=time.perf_counter()-generation_start
     mark('GENERATION_DONE')
     video=Path('/content/result.mp4')
-    filters=[]
-    args=['ffmpeg','-y','-loglevel','error']
-    for src in sources: args.extend(['-i',str(src)])
-    for i,frames in enumerate([73,73,94]):
-        duration=frames/24
-        filters.append(f'[{i}:v]trim=end_frame={frames},setpts=PTS-STARTPTS,scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1[v{i}]')
-        filters.append(f'[{i}:a]apad,atrim=duration={duration:.8f},asetpts=PTS-STARTPTS,afade=t=in:d=0.012,afade=t=out:st={duration-0.018:.8f}:d=0.018[a{i}]')
-    filters.append('[v0][a0][v1][a1][v2][a2]concat=n=3:v=1:a=1[v][a]')
-    run(args+['-filter_complex',';'.join(filters),'-map','[v]','-map','[a]','-t','10','-r','24','-c:v','libx264','-crf','17','-pix_fmt','yuv420p','-c:a','aac','-b:a','192k','-movflags','+faststart',str(video)])
+    encode(sources, job, video)
     mark('MP4_READY')
     print('Total seconds',round(time.perf_counter()-start,2),'Generation seconds',round(generation_s,2),flush=True)
 

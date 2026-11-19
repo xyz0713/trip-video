@@ -64,6 +64,17 @@ class PersonalVideoTest(unittest.TestCase):
         self.cloud.release.assert_called_once()
         self.cloud.allocate.assert_not_called()
 
+    def test_single_prompt_with_requested_dimensions_and_seconds(self):
+        for size, expected in [('1280x720', [1280, 720]), ('960×1280', [960, 1280])]:
+            with patch.object(app, 'recover', return_value='result.mp4') as render:
+                self.cli('generate', '--prompt', 'waves', '--size', size, '--seconds', '2.5')
+            job = json.loads((render.call_args.args[0] / 'job.json').read_bytes())
+            self.assertEqual([job['width'], job['height']], expected)
+            self.assertEqual(job['shots'], [dict(prompt='waves', image=False, frames=60)])
+        with self.assertRaises(app.Failure):
+            self.cli('generate', '--prompt', 'waves', '--seconds', 'nan')
+        self.assertEqual(self.cloud.allocate.call_count, 2)
+
     def test_model_failure_releases(self):
         job = app.new_ticket(['A','B','C'], [None]*3)
         app.atomic_write(job/'account.json', json.dumps(['owner@example.test','test-project']).encode())
@@ -79,10 +90,23 @@ class PersonalVideoTest(unittest.TestCase):
         s.loader.exec_module(once)
         if not shutil.which('ffmpeg') or not shutil.which('ffprobe'):
             self.skipTest('requires ffmpeg and ffprobe')
+        source = self.root/'source.mp4'
         rendered = self.root/'fixture.mp4'
-        subprocess.run(['ffmpeg','-nostdin','-v','error','-f','lavfi','-i','color=s=720x1280:r=24',
-                        '-f','lavfi','-i','anullsrc=r=48000:cl=stereo','-t','10',
-                        '-c:v','libx264','-preset','ultrafast','-c:a','aac',str(rendered)],check=True)
+        subprocess.run(['ffmpeg','-nostdin','-v','error','-f','lavfi','-i','color=s=160x96:r=24',
+                        '-f','lavfi','-i','anullsrc=r=48000:cl=stereo','-t','1',
+                        '-c:v','libx264','-preset','ultrafast','-c:a','aac',str(source)],check=True)
+        spec = importlib.util.spec_from_file_location('renderer', app.ASSETS / 'remote_render.py')
+        renderer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(renderer)
+        for width, height, frames in [(1280,720,[15]), (960,1280,[10, 15])]:
+            job = dict(width=width, height=height, shots=[{'frames': f} for f in frames])
+            renderer.encode([source] * len(frames), job, rendered)
+            info = json.loads(subprocess.check_output(['ffprobe','-v','error','-show_streams',
+                                                      '-of','json',str(rendered)]))
+            stream = next(s for s in info['streams'] if s['codec_type'] == 'video')
+            self.assertEqual((stream['width'], stream['height'], int(stream['nb_frames'])),
+                             (width, height, sum(frames)))
+        (self.root / 'job.json').write_text(json.dumps(job))
         (self.root/'remote_render.py').write_text(
             f'from pathlib import Path\nPath("result.mp4").write_bytes(Path({str(rendered)!r}).read_bytes())\n')
         once.run(self.root)
@@ -103,13 +127,16 @@ class PersonalVideoTest(unittest.TestCase):
         http = Mock()
         http.post.return_value.json.return_value = {'prompt_id':'server-task'}
         http.get.return_value.json.return_value = {'server-task':{'status':{'status_str':'success'}}}
-        scenes = [{'prompt': s, 'image': im} for s, im in zip('ABC',(False,True,False))]
+        scenes = [{'prompt': s, 'image': im, 'frames': 32} for s, im in zip('ABC',(False,True,False))]
+        job = dict(width=1280, height=720, shots=scenes)
         with patch.object(renderer,'requests',http):
-            files = renderer.generate_shots(scenes, json.loads((app.ASSETS/'graph.json').read_text()),
+            files = renderer.generate_shots(job, json.loads((app.ASSETS/'graph.json').read_text()),
                        self.root, Mock(), self.root/'log', 'http://local', '140:131', 'first_image')
         graphs = [c.kwargs['json']['prompt'] for c in http.post.call_args_list]
         self.assertEqual([g['140:131']['inputs']['prompt'] for g in graphs],list('ABC'))
-        self.assertEqual([g['140:131']['inputs']['length'] for g in graphs],[73,73,107])
+        self.assertEqual([g['140:131']['inputs']['length'] for g in graphs],[32,32,32])
         self.assertEqual([('image' in g) for g in graphs],[False,True,False])
         self.assertEqual(graphs[1]['image']['inputs']['image'],'ref_2.jpg')
         self.assertEqual(len(files),3)
+        for graph in graphs:
+            self.assertEqual((graph['140:131']['inputs']['width'], graph['140:131']['inputs']['height']), (1280,736))

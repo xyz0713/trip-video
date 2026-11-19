@@ -37,12 +37,15 @@ def render(root):
         info = subprocess.check_output([
             'ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type,width,height,duration',
             '-of', 'json', str(mp4)], timeout=30)
+        job = json.loads((root / 'job.json').read_bytes())
+        size = job['width'], job['height']
+        duration = sum(shot['frames'] for shot in job['shots']) / 24
         streams = json.loads(info)['streams']
         video = [s for s in streams if s['codec_type'] == 'video']
         audio = [s for s in streams if s['codec_type'] == 'audio']
         if (len(video) != 1 or len(audio) != 1 or
-                (video[0]['width'], video[0]['height']) != (720, 1280) or
-                any(abs(float(s['duration']) - 10) >= .05 for s in video + audio)):
+                (video[0]['width'], video[0]['height']) != size or
+                any(abs(float(s['duration']) - duration) >= .05 for s in video + audio)):
             raise ValueError('Invalid rendered media')
         publish({'state': 'done', 'size': mp4.stat().st_size,
                  'sha256': hashlib.sha256(mp4.read_bytes()).hexdigest()})

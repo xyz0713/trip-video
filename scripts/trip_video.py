@@ -9,6 +9,8 @@ import hashlib
 import io
 import json
 import logging
+import math
+import re
 import os
 import sys
 import tempfile
@@ -56,9 +58,27 @@ def ticket(value):
     return JOBS / value
 
 
-def new_ticket(prompts, images):
-    if len(prompts) != 3 or any(not p.strip() or len(p) > 4000 for p in prompts):
-        raise Failure('各1〜4000文字の場面指示を3つ指定してください。')
+def parse_size(value):
+    match = re.fullmatch(r'([0-9]+)[xX×]([0-9]+)', value)
+    if match:
+        width, height = map(int, match.groups())
+        if min(width, height) > 0 and width % 2 == height % 2 == 0:
+            return width, height
+    raise argparse.ArgumentTypeError('幅x高さを正の偶数で指定してください。')
+
+
+def new_ticket(prompts, images, size=(864, 480), seconds=None):
+    if not prompts or any(not p.strip() for p in prompts):
+        raise Failure('動画のプロンプトを指定してください。')
+    if any(images[len(prompts):]):
+        raise Failure('参考画像に対応するプロンプトがありません。')
+    seconds = 5 * len(prompts) if seconds is None else seconds
+    if not math.isfinite(seconds) or not 0 < seconds <= 150 * len(prompts):
+        raise Failure('尺は正の秒数で、1クリップあたり最大150秒です。')
+    total = round(seconds * 24)
+    frames, remainder = divmod(total, len(prompts))
+    if frames < 1:
+        raise Failure('各クリップが1フレーム以上になる尺を指定してください。')
     normalized = {}
     for i, path in enumerate(images, 1):
         if path:
@@ -73,7 +93,11 @@ def new_ticket(prompts, images):
     job.mkdir(parents=True, mode=0o700)
     for i, data in normalized.items():
         atomic_write(job / f'ref_{i}.jpg', data)
-    payload = {'shots': [{'prompt': p, 'image': i in normalized} for i, p in enumerate(prompts, 1)]}
+    payload = {
+        'width': size[0], 'height': size[1],
+        'shots': [{'prompt': prompt, 'image': i in normalized, 'frames': frames + int(i <= remainder)}
+                  for i, prompt in enumerate(prompts, 1)],
+    }
     atomic_write(job / 'job.json', json.dumps(payload, ensure_ascii=False).encode())
     print(f'受付ID {job.name}', flush=True)
     return job
@@ -142,6 +166,13 @@ def launch(info, job):
     paths = [job / 'job.json', *sorted(job.glob('ref_*.jpg')),
              *(ASSETS / f for f in ('remote_render.py', 'run_once.py', 'graph.json'))]
     files = {p.name: base64.b64encode(p.read_bytes()).decode('ascii') for p in paths}
+    # v0.1 receipts predate user-selected geometry and timing.
+    manifest = json.loads((job / 'job.json').read_bytes())
+    if 'width' not in manifest:
+        manifest.update(width=720, height=1280, model_size=[480, 864])
+        for shot, frames in zip(manifest['shots'], (73, 73, 94), strict=True):
+            shot['frames'] = frames
+        files['job.json'] = base64.b64encode(json.dumps(manifest).encode()).decode('ascii')
     # Atomic identical input replacement also permits resuming an interrupted upload.
     code = (
         'import base64, os, subprocess, sys, tempfile\nfrom pathlib import Path\n'
@@ -214,7 +245,7 @@ def recover(job, runtime):
 def main():
     import trip_auth
 
-    parser = argparse.ArgumentParser(description='trip本人のColabで音声付き縦型動画を生成')
+    parser = argparse.ArgumentParser(description='Colab上のMiniMax H3で動画を生成')
     sub = parser.add_subparsers(dest='command', required=True)
     login = sub.add_parser('login')
     login.add_argument('--account', required=True, help='使用する本人のGoogleメールアドレス')
@@ -223,8 +254,11 @@ def main():
         sub.add_parser(name)
     create = sub.add_parser('generate')
     create.add_argument('--prompt', action='append', required=True)
-    for i in range(1, 4):
-        create.add_argument(f'--image-{i}', type=Path)
+    create.add_argument('--size', type=parse_size, default=(864, 480), metavar='WIDTHxHEIGHT')
+    create.add_argument('--seconds', type=float, help='動画全体の秒数')
+    create.add_argument('--image', action='append', type=Path, default=[], help='参考画像（プロンプト順）')
+    for i in range(1, 4):  # Accept the image switches used by v0.1.
+        create.add_argument(f'--image-{i}', type=Path, help=argparse.SUPPRESS)
     for name in ('resume', 'cancel'):
         sub.add_parser(name).add_argument('id')
     args = parser.parse_args()
@@ -247,7 +281,16 @@ def main():
         return
     if args.command == 'generate':
         auth = trip_auth.session()
-        job = new_ticket(args.prompt, [getattr(args, f'image_{i}') for i in range(1, 4)])
+        images = list(args.image)
+        for i in range(3):
+            old_image = getattr(args, f'image_{i + 1}')
+            if old_image:
+                if len(images) <= i:
+                    images.extend([None] * (i + 1 - len(images)))
+                elif images[i]:
+                    raise Failure('同じ場面に参考画像が重複しています。')
+                images[i] = old_image
+        job = new_ticket(args.prompt, images, args.size, args.seconds)
         atomic_write(job / 'account.json', json.dumps([auth.trip_owner, auth.headers['x-goog-user-project']]).encode())
         runtime = Runtime(auth, job)
         try:
