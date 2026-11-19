@@ -67,7 +67,7 @@ def parse_size(value):
     raise argparse.ArgumentTypeError('幅x高さを正の偶数で指定してください。')
 
 
-def new_ticket(prompts, images, size=(864, 480), seconds=None):
+def new_ticket(prompts, images, size=(864, 480), seconds=None, draft=False):
     if not prompts or any(not p.strip() for p in prompts):
         raise Failure('動画のプロンプトを指定してください。')
     if any(images[len(prompts):]):
@@ -94,7 +94,7 @@ def new_ticket(prompts, images, size=(864, 480), seconds=None):
     for i, data in normalized.items():
         atomic_write(job / f'ref_{i}.jpg', data)
     payload = {
-        'width': size[0], 'height': size[1],
+        'width': size[0], 'height': size[1], 'draft': draft,
         'shots': [{'prompt': prompt, 'image': i in normalized, 'frames': frames + int(i <= remainder)}
                   for i, prompt in enumerate(prompts, 1)],
     }
@@ -155,7 +155,7 @@ def read_remote(info, filename):
         if r.status_code != 200:
             raise requests.HTTPError(response=r)
         obj = r.json()
-        return (base64.b64decode(obj['content'], validate=True)
+        return (base64.b64decode(''.join(obj['content'].split()), validate=True)
                 if obj.get('format') == 'base64' else obj['content'].encode())
     return None
 
@@ -255,6 +255,7 @@ def main():
     create = sub.add_parser('generate')
     create.add_argument('--prompt', action='append', required=True)
     create.add_argument('--size', type=parse_size, default=(864, 480), metavar='WIDTHxHEIGHT')
+    create.add_argument('--draft', action='store_true', help='試作用に推論を10ステップにする')
     create.add_argument('--seconds', type=float, help='動画全体の秒数')
     create.add_argument('--image', action='append', type=Path, default=[], help='参考画像（プロンプト順）')
     for i in range(1, 4):  # Accept the image switches used by v0.1.
@@ -290,7 +291,7 @@ def main():
                 elif images[i]:
                     raise Failure('同じ場面に参考画像が重複しています。')
                 images[i] = old_image
-        job = new_ticket(args.prompt, images, args.size, args.seconds)
+        job = new_ticket(args.prompt, images, args.size, args.seconds, args.draft)
         atomic_write(job / 'account.json', json.dumps([auth.trip_owner, auth.headers['x-goog-user-project']]).encode())
         runtime = Runtime(auth, job)
         try:

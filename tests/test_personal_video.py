@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import importlib.util
 import io
@@ -75,6 +76,20 @@ class PersonalVideoTest(unittest.TestCase):
             self.cli('generate', '--prompt', 'waves', '--seconds', 'nan')
         self.assertEqual(self.cloud.allocate.call_count, 2)
 
+    def test_mime_wrapped_jupyter_binary_download(self):
+        video = bytes(range(256)) * 4
+        response = Mock(status_code=200)
+        response.json.return_value = {'format': 'base64', 'content': base64.encodebytes(video).decode()}
+        with patch.object(app.requests, 'get', return_value=response):
+            self.assertEqual(app.read_remote({'url': 'https://test.invalid','token':'fake'}, 'result.mp4'), video)
+
+    def test_draft_option_reaches_job(self):
+        with patch.object(app, 'recover', return_value='result.mp4') as render:
+            self.cli('generate', '--prompt', 'pudding', '--draft')
+        job = json.loads((render.call_args.args[0] / 'job.json').read_bytes())
+        self.assertTrue(job['draft'])
+        self.assertEqual((job['width'], job['height'], job['shots'][0]['frames']), (864,480,120))
+
     def test_model_failure_releases(self):
         job = app.new_ticket(['A','B','C'], [None]*3)
         app.atomic_write(job/'account.json', json.dumps(['owner@example.test','test-project']).encode())
@@ -138,5 +153,11 @@ class PersonalVideoTest(unittest.TestCase):
         self.assertEqual([('image' in g) for g in graphs],[False,True,False])
         self.assertEqual(graphs[1]['image']['inputs']['image'],'ref_2.jpg')
         self.assertEqual(len(files),3)
+        self.assertEqual([g['140:124']['inputs']['steps'] for g in graphs], [20]*3)
+        job['draft'] = True
+        with patch.object(renderer,'requests',http):
+            renderer.generate_shots(job, json.loads((app.ASSETS/'graph.json').read_text()),
+                       self.root, Mock(), self.root/'log', 'http://local', '140:131', 'first_image')
+        self.assertEqual(http.post.call_args.kwargs['json']['prompt']['140:124']['inputs']['steps'],10)
         for graph in graphs:
             self.assertEqual((graph['140:131']['inputs']['width'], graph['140:131']['inputs']['height']), (1280,736))

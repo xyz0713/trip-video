@@ -14,6 +14,8 @@ def generate_shots(job, graph, comfy, server, log_path, base, node, first):
     width, height = job.get('model_size') or [((job[axis] + 31) // 32) * 32 for axis in ('width', 'height')]
     for shot, scene in enumerate(job['shots'], 1):
         job_graph=copy.deepcopy(graph)
+        if job.get('draft'):
+            job_graph['140:124']['inputs']['steps'] = 10
         job_graph['image']['inputs']['image']=f'ref_{shot}.jpg'
         job_graph[node]['inputs'].update(prompt=scene['prompt'], width=width, height=height,
                                          length=max(5, scene['frames']))
